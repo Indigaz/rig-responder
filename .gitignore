@@ -1,0 +1,10 @@
+.pio/
+build/
+compile_commands.json
+*.rig
+*.o
+*.bin
+*.elf
+*.hex
+*.map
+*.zip
