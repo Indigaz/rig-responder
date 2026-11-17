@@ -1,4 +1,11 @@
-// rig-responder v1.6 — board B (ESP32-S3-DevKitC-1) multi-protocol responder.
+// rig-responder v1.10 — board B (ESP32-S3-DevKitC-1) multi-protocol responder.
+//
+// v1.10: WRITE-SP ROOT CAUSE FIXED — dwDispatch() never cleared the s_cmd
+// accumulator, so each received byte was ORed into the previous byte
+// (0xCC|0x0F=0xCF, then monotonically to 0xFF). Only the first byte after
+// presence was ever correct. The DQ waveform + per-bit cb samples proved
+// B's bit sampling was always correct; the fault was post-sample assembly.
+// Also: s_matchRom now cleared on 0x55 (same stale-accumulator class).
 //
 // Protocols (all non-blocking, one loop):
 //   UART1  RX=4  TX=15  @115200  PING->PONG x10, others->ECHO:<line> x3, "GPIO"->mirror
@@ -96,11 +103,18 @@ static volatile uint32_t s_isrIgnored = 0; // edges ignored because B was drivin
 static volatile uint32_t s_mainTicks; // main-loop heartbeat (defined below)
 static volatile uint32_t s_loopStage; // loop() milestone (0..7), for probe diag
 static volatile uint32_t s_mainCore;  // core of the loop task (set in loop)
+// dedicated DQ waveform buffer (separate from the 16KB diag ring so the
+// probe's transitions don't compete with the per-bit cb markers). Each
+// transition = 3 bytes: time_lo, time_hi (16-bit us offset), level (0/1).
+static uint8_t s_wf[6144];
+static volatile uint16_t s_wfLen = 0;   // number of transitions stored
 static void dqProbeTask(void*) {
   uint32_t t0 = micros();
   uint32_t nowUs = 0;
   uint32_t iters = 0;
   bool last = ((GPIO.in >> DW_PIN) & 1) != 0;
+  s_wfLen = 1;
+  s_wf[0] = 0; s_wf[1] = 0; s_wf[2] = (uint8_t)(last ? 1 : 0);  // t=0 initial level
   diag("W0 ");
   diag(last ? "H" : "L");
   diag(" pc=");
@@ -113,6 +127,13 @@ static void dqProbeTask(void*) {
     iters++;
     if (lvl != last) {
       last = lvl;
+      if (s_wfLen < 2048) {
+        uint32_t t = nowUs > 60000 ? 60000 : nowUs;
+        s_wf[s_wfLen * 3]     = (uint8_t)(t & 0xFF);
+        s_wf[s_wfLen * 3 + 1] = (uint8_t)((t >> 8) & 0xFF);
+        s_wf[s_wfLen * 3 + 2] = (uint8_t)(lvl ? 1 : 0);
+        s_wfLen++;
+      }
       diag("W");
       diagU(nowUs);
       diag(" ");
@@ -180,6 +201,8 @@ static volatile uint32_t s_readPullUs = 0;
 static volatile uint32_t s_slotStart = 0;
 static volatile bool s_inSlot = false;
 static uint32_t s_presenceT0 = 0;
+static volatile uint32_t s_resetReleaseUs = 0;  // micros() of last reset release (presence window)
+static volatile uint32_t s_isrGlitch = 0;       // glitch falling edges ignored in presence window
 static uint8_t s_cmd = 0;
 static uint8_t s_cmdBits = 0;
 static uint8_t s_matchRom[8];
@@ -213,13 +236,16 @@ static void dwDispatch(uint8_t cmd) {
   diag("c="); diagU(cmd); diag(" ");
   s_inSlot = false;
   s_fallPend = false;
+  s_cmd = 0;   // v1.10: clear accumulator — v1.9 ORed each byte into the
+               // previous byte's value (0xCC|0x0F=0xCF ... -> 0xFF), so
+               // only the first byte after presence was ever correct.
   switch (cmd) {
     case 0x33: s_outCmd = 0x33; s_outPos = 0; s_outTotal = 64; s_state = DW_OUT; break; // read ROM
     case 0xAA: s_outCmd = 0xAA; s_outPos = 0; s_outTotal = 64; s_state = DW_OUT; break; // read scratchpad
     case 0xBE: s_outCmd = 0xBE; s_outPos = 0; s_outTotal = 72; s_state = DW_OUT; break; // read scratchpad 9
     case 0xCC: logAppend("DW cc"); s_state = DW_CMD; break;    // skip ROM: function command follows
     case 0x44: s_state = DW_CMD; break;    // convert: no data
-    case 0x55: s_matchBits = 0; s_state = DW_ROMWRITE; break;  // match ROM: 8 bytes follow
+    case 0x55: s_matchBits = 0; memset(s_matchRom, 0, sizeof s_matchRom); s_state = DW_ROMWRITE; break;  // match ROM: 8 bytes follow
     case 0x0F: logAppend("DW 0f"); s_spwBits = 0; s_state = DW_SPWRITE; break;     // write scratchpad: 8 bytes follow
     case 0xF0:
     case 0xF5:
@@ -257,6 +283,12 @@ void IRAM_ATTR dwGpioIsr(void *arg) {
   // B drives the line (OUTEN=1) the falling edge is B's own action.
   if ((GPIO.enable & (1u << DW_PIN)) != 0) { s_isrIgnored++; return; }
   uint32_t now = (uint32_t)micros();
+  // Ignore glitch falling edges in the post-reset presence window: no valid
+  // command slot can start within ~150us of the reset release (A samples
+  // presence @ +70us). A spurious edge here (observed ~3us after release,
+  // a 100us L-pulse) was sampled as a data bit and shifted the byte
+  // assembly by one position (0x0F -> 0xCF).
+  if (s_resetReleaseUs && (int32_t)(now - s_resetReleaseUs) < 150) { s_isrGlitch++; return; }
   // 1) drive read-0 bits / search read pairs NOW (latency-critical)
   if (s_state == DW_OUT) {
     if (s_outPos < s_outTotal && !dwOutBit(s_outPos)) {
@@ -333,16 +365,19 @@ static void dwSlavePoll() {
   }
 
   // Reset detection (v1.9): any falling edge starts a LOW period. Write
-  // slots are <= 65us low, read slots ~3us; a line STILL LOW >100us after
-  // the edge is the 480us reset pulse. Based on the edge's own timestamp
-  // (s_fallUs), so it self-heals even if intermediate slot edges were
-  // missed. Excluded states: RESET_WAIT (already handling it), PRESENCE
-  // (B's own pull reads LOW).
+  // slots are <= 65us low, read slots ~3us. A valid reset is >= 480us low,
+  // but A releases at exactly 480us so a >=480us check races the release.
+  // The old >100us threshold tripped on the ~100us stray low pulse A emits
+  // 3us after the reset release — B treated it as a second reset and issued
+  // a spurious presence, shifting every subsequent byte by one bit
+  // (0x0F -> 0xCF). 300us sits safely in the dead band: well above the
+  // stray pulse, well below the reset release, so it fires reliably while
+  // the line is still LOW.
   {
     uint32_t now = (uint32_t)micros();
     if ((s_state == DW_IDLE || s_state == DW_CMD || s_state == DW_ROMWRITE ||
          s_state == DW_SPWRITE || s_state == DW_OUT || s_state == DW_SEARCH) &&
-        (int32_t)(now - s_fallUs) > 100 && dwLevel() == LOW) {
+        (int32_t)(now - s_fallUs) >= 300 && dwLevel() == LOW) {
       bool outen = ((GPIO.enable & (1u << DW_PIN)) != 0);
       logAppend("DW reset s="); logUint((uint32_t)s_state);
       logAppend(" dt="); logUint(s_lastDt);
@@ -381,6 +416,7 @@ static void dwSlavePoll() {
         s_inSlot = false;
         dwPull();
         s_presenceT0 = now;
+        s_resetReleaseUs = now;   // presence window opens (glitch filter)
         logAppend("DW presence");
         diag("P ");
         s_state = DW_PRESENCE;
@@ -396,6 +432,7 @@ static void dwSlavePoll() {
         dwRelease();
         s_state = DW_CMD;
         s_cmd = 0; s_cmdBits = 0; s_inSlot = false; s_fallPend = false;
+        s_resetReleaseUs = 0;     // presence window closed
       }
       break;
     }
@@ -686,6 +723,15 @@ static void pollConsole() {
       xTaskCreatePinnedToCore(dqProbeTask, "dqprobe", 2048, NULL, 2, NULL, 0);
       Serial.println("DQPROBE: started");
     }
+  } else if (line == "WFDUMP") {
+    // print the dedicated waveform buffer (t_us level), one transition per line
+    Serial.println("WFDUMP:");
+    uint16_t n = s_wfLen;
+    Serial.print("nt="); Serial.println((int)n);
+    for (uint16_t i = 0; i < n; i++) {
+      uint32_t t = (uint32_t)s_wf[i * 3] | ((uint32_t)s_wf[i * 3 + 1] << 8);
+      Serial.print(t); Serial.print(' '); Serial.println((int)s_wf[i * 3 + 2]);
+    }
   }
 }
 
@@ -749,7 +795,7 @@ void setup() {
   delay(5);
   Serial.printf("DQ idle level: %d (expect 1 = pull-up OK)\n", dwLevel());
 
-  Serial.printf("RIG-RESPONDER v1.9 up\n");
+  Serial.printf("RIG-RESPONDER v1.10 up\n");
   Serial.printf("ROM:");
   for (int i = 0; i < 8; i++) Serial.printf(" %02X", s_rom[i]);
   Serial.println();
