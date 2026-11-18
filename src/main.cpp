@@ -677,6 +677,14 @@ static void pollConsole() {
     digitalWrite(MIRROR_OUT, LOW);
     u1.begin(115200, SERIAL_8N1, U1_RX, U1_TX);  // restore UART1
     logAppend("STOP (out=15 low, u1 restored)");
+  } else if (line == "UART") {
+    // Release GPIO mirror: pin 15 is wired to A's UART RX (GPIO 44);
+    // mirror mode holds it LOW (A's UART1 RX reads a 0x00 stream).
+    s_mirror = false;
+    s_square = false;
+    digitalWrite(MIRROR_OUT, LOW);
+    u1.begin(115200, SERIAL_8N1, U1_RX, U1_TX);  // pin 15 back to UART1 TX
+    logAppend("MODE=UART (pin15 restored to UART1 TX)");
   } else if (line == "GPIO") {
     u1.end();
     s_mirror = true;
