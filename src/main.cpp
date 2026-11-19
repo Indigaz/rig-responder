@@ -325,16 +325,24 @@ void IRAM_ATTR dwGpioIsr(void *arg) {
 
 static void flushLog() {
   if (s_logLen == 0) return;
-  // flush only when the 1-Wire state machine is fully idle
+  // v1.13: flush in small chunks (<=32 B ~= 2.7 ms at 115200) instead of the
+  // whole 300-char buffer (26 ms block). A whole-buffer flush during a
+  // 1-Wire retry storm starved loop(): the square degraded to ~20-50 Hz and
+  // mirror transitions fell through the poll window. Chunking caps the
+  // block at 2.7 ms and keeps it out of 1-Wire windows via the idle guard.
   if (s_state == DW_IDLE && !s_readPull && (uint32_t)micros() - s_fallUs > 2000) {
-    Serial.print(s_logBuf);
-    s_logLen = 0;
+    int n = s_logLen < 32 ? s_logLen : 32;
+    Serial.write((const uint8_t*)s_logBuf, n);
+    memmove(s_logBuf, s_logBuf + n, (size_t)(s_logLen - n));
+    s_logLen -= n;
   }
 }
 
 // non-blocking slave loop; main loop period is a few us at 240 MHz
 static volatile uint32_t s_lastTicks = 0;
 static volatile uint32_t s_lastTickTime = 0;
+static volatile uint32_t s_lastStaleLog = 0;  // v1.12 stale-recovery log rate limit
+static volatile uint32_t s_lastDeadLog = 0;   // v1.12 dead-ISR log rate limit
 static void dwSlavePoll() {
   // v1.9 fix: the ISR timestamps edges with a FRESH micros(); the main
   // loop's stale `now` (captured before the ISR ran) can be a few us BEHIND
@@ -358,9 +366,30 @@ static void dwSlavePoll() {
     if (s_irqTicks != s_lastTicks) {
       s_lastTicks = s_irqTicks;
       s_lastTickTime = now;
-    } else if (s_state != DW_IDLE && now - s_lastTickTime > 500) {
-      logAppend("DW IRQ DEAD ticks="); logUint(s_irqTicks);
-      s_lastTickTime = now;
+    } else if (s_state != DW_IDLE) {
+      if (now - s_lastTickTime > 5000) {
+        // Stale transaction: no DQ edges for 5 ms while the state machine
+        // is active. A real exchange never has that gap (bit slots 65 us,
+        // reset 480 us), so force back to idle: a reset is the only way a
+        // transaction starts, so this cannot disturb an in-flight one.
+        // (v1.12: the 500 us watchdog alone appended a log line every
+        // 500 us; the 300-char buffer filled and flushLog blocked loop()
+        // ~26 ms at a time — the 1 kHz square degraded to ~20 Hz, 1-Wire
+        // write-slot samples were missed (1-bit misreads), and mirror
+        // transitions fell through the poll window.)
+        s_state = DW_IDLE;
+        s_inSlot = false;
+        s_fallPend = false;
+        if (now - s_lastStaleLog > 100000) {
+          logAppend("DW STALE->IDLE ticks="); logUint(s_irqTicks);
+          s_lastStaleLog = now;
+        }
+      } else if (now - s_lastTickTime > 500 && now - s_lastDeadLog > 100000) {
+        // Genuine mid-transaction ISR stall: log, but rate-limit to
+        // 100 ms so logging can never starve the loop again.
+        logAppend("DW IRQ DEAD ticks="); logUint(s_irqTicks);
+        s_lastDeadLog = now;
+      }
     }
   }
 
@@ -475,9 +504,10 @@ static void dwSlavePoll() {
         s_spwBits++;
         s_inSlot = false;
         if (s_spwBits > 0 && (s_spwBits % 8) == 0) {
-          char pfx[3] = {'b', "0123456789ABCDEF"[s_spwBits / 8], 0};
-          logAppend(pfx);
-          logHex(s_spwBytes[s_spwBits / 8 - 1]);
+          // v1.13: per-byte detail goes to the diag ring only — logging all
+          // 8 bytes to the 300-char console buffer during a retry storm
+          // kept the buffer full and made flushLog starve loop().
+          diag("b"); diagU(s_spwBits / 8); diag(" "); diagU(s_spwBytes[s_spwBits / 8 - 1]); diag(" ");
         }
         if (s_spwBits >= 64) {
           logAppend("DW spad written: ");
@@ -803,14 +833,14 @@ void setup() {
   delay(5);
   Serial.printf("DQ idle level: %d (expect 1 = pull-up OK)\n", dwLevel());
 
-  Serial.printf("RIG-RESPONDER v1.10 up\n");
+  Serial.println("RIG-RESPONDER v1.13 up");
   Serial.printf("ROM:");
   for (int i = 0; i < 8; i++) Serial.printf(" %02X", s_rom[i]);
   Serial.println();
   Serial.printf("SPAD:");
   for (int i = 0; i < 9; i++) Serial.printf(" %02X", s_spad[i]);
   Serial.println();
-  Serial.println("I2C slave SDA=8 SCL=9 @0x50; DQ=11 (open-drain ISR); UART1 RX=4 TX=15; MIRROR in=10 out=15; console: SQUARE/STOP/GPIO/AUDIT n");
+  Serial.println("I2C slave SDA=8 SCL=9 @0x50; DQ=11 (open-drain ISR); UART1 RX=4 TX=15; MIRROR in=10 out=15; console: SQUARE/STOP/GPIO/UART/AUDIT n");
 }
 
 void loop() {
