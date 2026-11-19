@@ -597,7 +597,7 @@ static void handleUartLine(String line) {
     u1.end();
     s_mirror = true;
     s_square = false;
-    pinMode(MIRROR_IN, INPUT);
+    pinMode(MIRROR_IN, INPUT_PULLUP);  // v1.15
     pinMode(MIRROR_OUT, OUTPUT);
     digitalWrite(MIRROR_OUT, LOW);
     logAppend("MODE=GPIO (mirror in=10 -> out=15)");
@@ -730,7 +730,7 @@ static void pollConsole() {
     u1.end();
     s_mirror = true;
     s_square = false;
-    pinMode(MIRROR_IN, INPUT);
+    pinMode(MIRROR_IN, INPUT_PULLUP);  // v1.15
     pinMode(MIRROR_OUT, OUTPUT);
     digitalWrite(MIRROR_OUT, LOW);
     logAppend("MODE=GPIO (mirror in=10 -> out=15)");
@@ -839,12 +839,12 @@ void setup() {
   Wire.onReceive(onI2cReceive);
   Wire.onRequest(onI2cRequest);
 
-  pinMode(MIRROR_IN, INPUT);
+  pinMode(MIRROR_IN, INPUT_PULLUP);  // v1.15
 
   delay(5);
   Serial.printf("DQ idle level: %d (expect 1 = pull-up OK)\n", dwLevel());
 
-  Serial.println("RIG-RESPONDER v1.14 up");
+  Serial.println("RIG-RESPONDER v1.15 up");
   Serial.printf("ROM:");
   for (int i = 0; i < 8; i++) Serial.printf(" %02X", s_rom[i]);
   Serial.println();
