@@ -740,6 +740,46 @@ static void pollConsole() {
     if (secs < 1) secs = 1;
     if (secs > 30) secs = 30;
     auditStart(secs);
+  } else if (line.startsWith("MEASURE")) {
+    // v1.16 bounded pin-frequency/duty measurement: MEASURE <pin> [ms]
+    // Reads the pin (plain input) over ms (100..5000, default 2000),
+    // counts rising/falling edges + cumulative HIGH time, then reports one
+    // parse-friendly line and returns to the prompt (no state change).
+    int pin = 10;
+    uint32_t ms = 2000;
+    String rest = line.substring(7);
+    int sp = rest.indexOf(' ');
+    String pinTok = (sp >= 0) ? rest.substring(0, sp) : rest;
+    if (pinTok.length() > 0) pin = pinTok.toInt();
+    if (sp >= 0) {
+      String msTok = rest.substring(sp + 1);
+      if (msTok.length() > 0) ms = msTok.toInt();
+    }
+    if (pin < 0 || pin > 48) { Serial.println("MEASURE: bad pin"); return; }
+    if (ms < 100) ms = 100;
+    if (ms > 5000) ms = 5000;
+    pinMode(pin, INPUT_PULLUP);
+    uint32_t rising = 0, falling = 0, hiTime = 0, hiStart = 0;
+    int last = digitalRead(pin);
+    if (last == 1) hiStart = (uint32_t)micros();
+    uint32_t t0 = (uint32_t)micros();
+    uint32_t tEnd = t0 + ms * 1000UL;
+    while ((uint32_t)micros() < tEnd) {
+      int cur = digitalRead(pin);
+      if (cur != last) {
+        uint32_t now = (uint32_t)micros();
+        if (cur == 1) { rising++; hiStart = now; }
+        else { falling++; if (hiStart) hiTime += (now - hiStart); hiStart = 0; }
+        last = cur;
+      }
+    }
+    if (last == 1 && hiStart) hiTime += ((uint32_t)micros() - hiStart);
+    float freq = ((rising + falling) / 2.0f) / (ms / 1000.0f);
+    float duty = (hiTime / (float)(ms * 1000UL)) * 100.0f;
+    char mbuf[96];
+    snprintf(mbuf, sizeof(mbuf), "MEASURE pin=%d rising=%lu falling=%lu freq=%.0fHz duty=%.1f%%",
+             pin, (unsigned long)rising, (unsigned long)falling, freq, duty);
+    Serial.println(mbuf);
   } else if (line == "DUMP") {
     int len = s_diagLen;
     if (len == 0) {
@@ -844,7 +884,7 @@ void setup() {
   delay(5);
   Serial.printf("DQ idle level: %d (expect 1 = pull-up OK)\n", dwLevel());
 
-  Serial.println("RIG-RESPONDER v1.15 up");
+  Serial.println("RIG-RESPONDER v1.16 up");
   Serial.printf("ROM:");
   for (int i = 0; i < 8; i++) Serial.printf(" %02X", s_rom[i]);
   Serial.println();
