@@ -343,6 +343,7 @@ static volatile uint32_t s_lastTicks = 0;
 static volatile uint32_t s_lastTickTime = 0;
 static volatile uint32_t s_lastStaleLog = 0;  // v1.12 stale-recovery log rate limit
 static volatile uint32_t s_lastDeadLog = 0;   // v1.12 dead-ISR log rate limit
+static volatile uint32_t s_lastStuckLog = 0;  // v1.14 stuck-LOW reset log rate limit
 static void dwSlavePoll() {
   // v1.9 fix: the ISR timestamps edges with a FRESH micros(); the main
   // loop's stale `now` (captured before the ISR ran) can be a few us BEHIND
@@ -407,15 +408,25 @@ static void dwSlavePoll() {
     if ((s_state == DW_IDLE || s_state == DW_CMD || s_state == DW_ROMWRITE ||
          s_state == DW_SPWRITE || s_state == DW_OUT || s_state == DW_SEARCH) &&
         (int32_t)(now - s_fallUs) >= 300 && dwLevel() == LOW) {
-      bool outen = ((GPIO.enable & (1u << DW_PIN)) != 0);
-      logAppend("DW reset s="); logUint((uint32_t)s_state);
-      logAppend(" dt="); logUint(s_lastDt);
-      logAppend(" out="); logUint(outen ? 1 : 0);
-      logAppend(" pull="); logUint(s_readPull ? 1 : 0);
-      logAppend(" age="); logUint(s_readPull ? now - s_readPullUs : 0);
-      diag("F s="); diagU((uint32_t)s_state); diag(" dt="); diagU(s_lastDt);
-      diag(" o"); diagU(outen ? 1 : 0); diag(" p"); diagU(s_readPull ? 1 : 0);
-      diag(" a"); diagU(s_readPull ? now - s_readPullUs : 0); diag(" ");
+      // v1.14: a stuck-LOW line (last real edge >10ms ago — e.g. A left
+      // DQ driven low: DIO 'set' + 'mode hiz' does not release pins)
+      // re-fired this block every loop pass. The 300-char log buffer ran
+      // permanently full and dropped every other log line (SQUARE/MODE/
+      // AUDIT/STOP) while loop() slowed to ~10ms (1 kHz square degraded
+      // to ~48 Hz). Rate-limit the stuck case to one line per 200ms.
+      bool stuck = s_lastDt > 10000;
+      if (!stuck || (int32_t)(now - s_lastStuckLog) >= 200000) {
+        if (stuck) s_lastStuckLog = now;
+        bool outen = ((GPIO.enable & (1u << DW_PIN)) != 0);
+        logAppend("DW reset s="); logUint((uint32_t)s_state);
+        logAppend(" dt="); logUint(s_lastDt);
+        logAppend(" out="); logUint(outen ? 1 : 0);
+        logAppend(" pull="); logUint(s_readPull ? 1 : 0);
+        logAppend(" age="); logUint(s_readPull ? now - s_readPullUs : 0);
+        diag("F s="); diagU((uint32_t)s_state); diag(" dt="); diagU(s_lastDt);
+        diag(" o"); diagU(outen ? 1 : 0); diag(" p"); diagU(s_readPull ? 1 : 0);
+        diag(" a"); diagU(s_readPull ? now - s_readPullUs : 0); diag(" ");
+      }
       s_inSlot = false;
       s_readPull = false;
       s_writeEdge = false;
@@ -833,7 +844,7 @@ void setup() {
   delay(5);
   Serial.printf("DQ idle level: %d (expect 1 = pull-up OK)\n", dwLevel());
 
-  Serial.println("RIG-RESPONDER v1.13 up");
+  Serial.println("RIG-RESPONDER v1.14 up");
   Serial.printf("ROM:");
   for (int i = 0; i < 8; i++) Serial.printf(" %02X", s_rom[i]);
   Serial.println();
