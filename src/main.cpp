@@ -576,6 +576,43 @@ static uint8_t crc8(const uint8_t* d, uint8_t n) {
   return crc;
 }
 
+// ---- I2C master helpers (v1.17) ----
+static void onI2cReceive(int count);   // fwd (defined below)
+static void onI2cRequest(void);        // fwd (defined below)
+// Token parse: 0x-prefixed = hex, bare numeric = decimal (A's parser convention).
+static int bpTok(const String& t) {
+  if (t.startsWith("0x") || t.startsWith("0X")) return (int)strtol(t.c_str(), nullptr, 16);
+  return t.toInt();
+}
+// End the 0x50 slave, re-init on the same pins (8/9) as master @100 kHz.
+static void i2cBeginMaster() {
+  Wire.end();
+  Wire.begin(I2C_SDA, I2C_SCL, 100000);
+}
+// Restore the 0x50 slave (callbacks survive end/begin; re-register defensively).
+static void i2cRestoreSlave() {
+  Wire.end();
+  Wire.begin(SLAVE_ADDR, I2C_SDA, I2C_SCL, 400000);
+  Wire.onReceive(onI2cReceive);
+  Wire.onRequest(onI2cRequest);
+}
+// Split `line` from `off` into up to `max` space-separated tokens.
+static int bpTokens(const String& line, int off, String* toks, int max) {
+  String rest = line.substring(off);
+  int skip = 0;  // tolerate a leading space (command + separator)
+  while (rest.length() > (uint32_t)skip && rest[skip] == ' ') skip++;
+  rest = rest.substring(skip);
+  int nt = 0;
+  int pos = rest.indexOf(' ');
+  while (nt < max && pos >= 0) {
+    toks[nt++] = rest.substring(0, pos);
+    rest = rest.substring(pos + 1);
+    pos = rest.indexOf(' ');
+  }
+  if (nt < max && rest.length() > 0) toks[nt++] = rest;
+  return nt;
+}
+
 // ---- I2C slave (register pointer protocol; deferred log) ----
 static void onI2cReceive(int count) {
   logAppend("I2C rx n="); logUint((uint32_t)count);
@@ -747,7 +784,7 @@ static void pollConsole() {
     // parse-friendly line and returns to the prompt (no state change).
     int pin = 10;
     uint32_t ms = 2000;
-    String rest = line.substring(7);
+    String rest = line.substring(8);
     int sp = rest.indexOf(' ');
     String pinTok = (sp >= 0) ? rest.substring(0, sp) : rest;
     if (pinTok.length() > 0) pin = pinTok.toInt();
@@ -780,6 +817,48 @@ static void pollConsole() {
     snprintf(mbuf, sizeof(mbuf), "MEASURE pin=%d rising=%lu falling=%lu freq=%.0fHz duty=%.1f%%",
              pin, (unsigned long)rising, (unsigned long)falling, freq, duty);
     Serial.println(mbuf);
+  } else if (line.startsWith("IWRITE")) {
+    // v1.17 I2C master write: IWRITE <addr> <b1..b8>. Temporarily ends the
+    // 0x50 slave, master-transfers on the same pins (8/9 @100 kHz), restores
+    // the slave, and reports one line.
+    String toks[10];
+    int nt = bpTokens(line, 7, toks, 10);
+    if (nt < 2) { Serial.println("IWRITE: bad args"); return; }
+    int addr = bpTok(toks[0]);
+    uint8_t bytes[8];
+    int nb = 0;
+    for (int i = 1; i < nt && nb < 8; i++) bytes[nb++] = (uint8_t)bpTok(toks[i]);
+    if (addr < 0x08 || addr > 0x77 || nb < 1) { Serial.println("IWRITE: bad args"); return; }
+    i2cBeginMaster();
+    Wire.beginTransmission(addr);
+    for (int i = 0; i < nb; i++) Wire.write(bytes[i]);
+    uint8_t err = Wire.endTransmission();
+    i2cRestoreSlave();
+    char ib[48];
+    snprintf(ib, sizeof(ib), "IWRITE 0x%02X: %d bytes %s", addr, nb, err == 0 ? "ACK" : "NACK");
+    Serial.println(ib);
+  } else if (line.startsWith("IREAD")) {
+    // v1.17 I2C master read: IREAD <addr> <n> (n 1..16).
+    String toks[4];
+    int nt = bpTokens(line, 6, toks, 4);
+    if (nt < 2) { Serial.println("IREAD: bad args"); return; }
+    int addr = bpTok(toks[0]);
+    int n = bpTok(toks[1]);
+    if (addr < 0x08 || addr > 0x77 || n < 1) { Serial.println("IREAD: bad args"); return; }
+    if (n > 16) n = 16;
+    i2cBeginMaster();
+    uint8_t got = (uint8_t)Wire.requestFrom(addr, n);
+    String hexs;
+    for (int i = 0; i < got; i++) {
+      uint8_t b = (uint8_t)Wire.read();
+      char hb[3];
+      snprintf(hb, sizeof(hb), "%02X", b);
+      hexs += hb;
+    }
+    i2cRestoreSlave();
+    char ir[72];
+    snprintf(ir, sizeof(ir), "IREAD 0x%02X: %d bytes %s", addr, got, hexs.c_str());
+    Serial.println(ir);
   } else if (line == "DUMP") {
     int len = s_diagLen;
     if (len == 0) {
@@ -884,7 +963,7 @@ void setup() {
   delay(5);
   Serial.printf("DQ idle level: %d (expect 1 = pull-up OK)\n", dwLevel());
 
-  Serial.println("RIG-RESPONDER v1.16 up");
+  Serial.println("RIG-RESPONDER v1.17 up");
   Serial.printf("ROM:");
   for (int i = 0; i < 8; i++) Serial.printf(" %02X", s_rom[i]);
   Serial.println();
