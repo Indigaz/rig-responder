@@ -1,5 +1,12 @@
 // rig-responder v1.10 — board B (ESP32-S3-DevKitC-1) multi-protocol responder.
 //
+// v1.18: SPWRITE ACCUMULATOR FIXED — s_spwBytes (static) was never cleared
+// between 0x0F writes, so each new scratchpad write ORed its 8 bytes into
+// the PREVIOUS write's contents (DW_SPWRITE samples into s_spwBytes via |=;
+// DS18B20 scratchpad write REPLACES). Every write after the first was
+// corrupted (old|new). First write after boot worked by luck (OR with the
+// zero-initialized array). Fix: memset(s_spwBytes) in dwDispatch 0x0F.
+//
 // v1.10: WRITE-SP ROOT CAUSE FIXED — dwDispatch() never cleared the s_cmd
 // accumulator, so each received byte was ORed into the previous byte
 // (0xCC|0x0F=0xCF, then monotonically to 0xFF). Only the first byte after
@@ -246,7 +253,14 @@ static void dwDispatch(uint8_t cmd) {
     case 0xCC: logAppend("DW cc"); s_state = DW_CMD; break;    // skip ROM: function command follows
     case 0x44: s_state = DW_CMD; break;    // convert: no data
     case 0x55: s_matchBits = 0; memset(s_matchRom, 0, sizeof s_matchRom); s_state = DW_ROMWRITE; break;  // match ROM: 8 bytes follow
-    case 0x0F: logAppend("DW 0f"); s_spwBits = 0; s_state = DW_SPWRITE; break;     // write scratchpad: 8 bytes follow
+    case 0x0F: logAppend("DW 0f"); s_spwBits = 0;
+               /* v1.18: clear the per-byte accumulator — s_spwBytes is
+                  static and was never cleared between writes, so each new
+                  0x0F write ORed its bytes into the PREVIOUS write's
+                  contents (s_spwBytes |= new; DS18B20 write replaces).
+                  First write after boot worked by luck (OR with zero). */
+               memset(s_spwBytes, 0, sizeof s_spwBytes);
+               s_state = DW_SPWRITE; break;     // write scratchpad: 8 bytes follow
     case 0xF0:
     case 0xF5:
       s_searchPos = 0; s_searchMatched = true; s_searchPhase = 0; s_writeEdge = false;
@@ -963,7 +977,7 @@ void setup() {
   delay(5);
   Serial.printf("DQ idle level: %d (expect 1 = pull-up OK)\n", dwLevel());
 
-  Serial.println("RIG-RESPONDER v1.17 up");
+  Serial.println("RIG-RESPONDER v1.18 up");
   Serial.printf("ROM:");
   for (int i = 0; i < 8; i++) Serial.printf(" %02X", s_rom[i]);
   Serial.println();
